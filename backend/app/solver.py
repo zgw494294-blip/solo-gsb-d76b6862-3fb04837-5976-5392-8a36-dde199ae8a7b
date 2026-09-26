@@ -31,6 +31,15 @@ Aω=0，对其零空间的任意允许运动 v，外加转矩向量 τ 均须满
 s、r、c 三轴，组内任意两轴间一步可达；并行关系各自计数。以经过的关系
 数为路径长度做无权 BFS，返回最短链路总数、按每步“关系录入序号、到达
 轴录入序号”字典序最小的一条最短链路，以及所有最短链路必经的关系序号。
+
+/api/mesh-harmonics（啮合谐波重合诊断）复用轴/关系/已知转速的全部校验
+与同一套有理数求解：外、内啮合基频 f = za|ωa|/60 Hz（由啮合方程亦等于
+zb|ωb|/60），行星组基频 f = zs|ωs−ωc|/60 Hz（亦等于 zr|ωr−ωc|/60）。
+模型无解时原样返回 /api/solve 的冲突信息；欠定时，基频仿射表达式中自由
+变量系数非零的关系标为未确定、不参与比较，其余关系仍给精确基频（包括
+精确为 0 的基频，但零基频不产生谐波）。对每个确定且非零的基频取 1～12
+次整数倍谐波，按精确频率（Fraction）分组，只保留含至少两条不同关系的
+重合组；组内条目按（关系录入序号、谐波次数）排序，组间按频率升序。
 """
 
 from collections import deque
@@ -51,6 +60,7 @@ MAX_TORQUE_KNOWN = MAX_SHAFTS    # 已知/待求互不相交，总数天然不�
 MIN_TORQUE_UNKNOWN = 1
 MAX_TORQUE_UNKNOWN = MAX_SHAFTS
 MAX_DIGITS = 18  # 数字位数上限，防止恶意超大整数导致运算爆炸
+MAX_HARMONIC = 12  # 啮合谐波次数上限：取基频的 1～12 次谐波参与重合比较
 
 
 class Shaft(BaseModel):
@@ -472,6 +482,159 @@ def solve(req: SolveRequest) -> dict:
         "free_count": len(free_cols),
         "free_shafts": [shaft_ids[c] for c in free_cols],
         "expressions": expressions,
+    }
+
+
+def _shaft_affine(
+    mat: list[list[Fraction]],
+    pivot_cols: list[int],
+    free_cols: list[int],
+    n: int,
+) -> list[tuple[Fraction, list[Fraction]]]:
+    """RREF 后每根轴转速 ω 的仿射表达式（常数项, [对各自由列的系数]）。
+
+    主元轴 c 取其主元行：ω_c = R[row(c)][n] − Σ_f R[row(c)][f]·x_f；
+    自由轴 f：常数项 0，对自身系数 1、其余自由变量 0。
+    """
+    pivot_row_of = {c: i for i, c in enumerate(pivot_cols)}
+    affine: list[tuple[Fraction, list[Fraction]]] = []
+    for j in range(n):
+        if j in pivot_row_of:
+            r = pivot_row_of[j]
+            affine.append((mat[r][n], [-mat[r][f] for f in free_cols]))
+        else:
+            coefs = [Fraction(1) if f == j else Fraction(0) for f in free_cols]
+            affine.append((Fraction(0), coefs))
+    return affine
+
+
+def mesh_harmonics(req: SolveRequest) -> dict:
+    """啮合谐波重合诊断：各关系基频（Hz）及其 1～12 次谐波的精确重合组。
+
+    录入校验与转速求解完全复用（_prepare：轴/关系/已知转速）。有理数求解
+    “传动关系 + 已知转速”模型：无解时原样返回 /api/solve 的冲突信息；
+    唯一解/欠定下，把每根轴转速写为自由变量的仿射表达式（常数, 系数）。
+      外/内啮合：基频 = za·|ωa|/60（啮合方程保证 = zb·|ωb|/60）
+      行星组：  基频 = zs·|ωs−ωc|/60（保证 = zr·|ωr−ωc|/60）
+    基频表达式中任一自由变量系数非零（依赖自由变量）即标为未确定，不参与
+    谐波比较；其余给出精确有理数基频（精确为 0 时列出但不产生谐波）。对
+    每个确定且非零的基频展开 1～12 次整数倍谐波，以精确频率（Fraction）
+    分组：只保留含至少两条不同关系的组，组内按（关系录入序号、谐波次数）
+    排序，组间按频率升序。
+    """
+    prepared = _prepare(req)
+    shaft_ids = prepared["shaft_ids"]
+    index = prepared["index"]
+    n = prepared["n"]
+    rows = prepared["rows"]
+    row_tags = prepared["row_tags"]
+
+    # ---------- 与 /api/solve 同一套有理数 RREF ----------
+    mat = [row[:] for row in rows]
+    pivot_cols = _rref(mat, n)
+
+    if any(all(row[j] == 0 for j in range(n)) and row[n] != 0 for row in mat):
+        # 无解：原样返回冲突定位（删除法得到的不可再缩减冲突集）
+        kept = _minimize_conflict(rows, n)
+        return {
+            "status": "inconsistent",
+            "shafts": shaft_ids,
+            "message": "方程组出现矛盾方程 0 = 非零常数，该齿轮系无解。",
+            "conflict": [
+                {"type": row_tags[j][0], "index": row_tags[j][1]} for j in kept
+            ],
+        }
+
+    pivot_set = set(pivot_cols)
+    free_cols = [j for j in range(n) if j not in pivot_set]
+    free_pos = {c: t for t, c in enumerate(free_cols)}
+    affine = _shaft_affine(mat, pivot_cols, free_cols, n)
+
+    def signed_rel_speed(positions: tuple[int, ...], teeth: tuple[int, ...]) -> tuple[Fraction, list[Fraction]]:
+        """带符号啮合相对转速（rpm，仿射式）：外/内啮合取 za·ωa，行星组取 zs·(ωs−ωc)。
+
+        与构造传动方程 _relation_row 选用的同一对轴/齿数；由齐次啮合方程
+        保证其绝对值与另一种算法（zb·ωb、zr·(ωr−ωc)）精确相等。
+        """
+        if len(positions) == 2:
+            (ia, _ib), (za, _zb) = positions, teeth
+            c0, cc = affine[ia]
+            z = Fraction(za)
+        else:
+            (is_, _ir, ic), (zs, _zr) = positions, teeth
+            c0s, ccs = affine[is_]
+            c0c, ccc = affine[ic]
+            c0 = c0s - c0c
+            cc = [a - b for a, b in zip(ccs, ccc)]
+            z = Fraction(zs)
+        return z * c0, [z * c for c in cc]
+
+    # ---------- 每条关系的基频：确定（含零）/ 未确定 ----------
+    bases: list[dict] = []
+    determined: list[tuple[int, Fraction]] = []  # (关系录入序号, 非零基频 Hz)
+    for k, rel in enumerate(req.relations or [], start=1):
+        if rel.type in ("external", "internal"):
+            positions = (index[_parse_int(rel.a)], index[_parse_int(rel.b)])
+            teeth = (_parse_int(rel.za), _parse_int(rel.zb))
+            formula = f"za·|ωa|/60 = {teeth[0]}·|ω{_parse_int(rel.a)}|/60"
+        else:
+            positions = (
+                index[_parse_int(rel.s)],
+                index[_parse_int(rel.r)],
+                index[_parse_int(rel.c)],
+            )
+            teeth = (_parse_int(rel.zs), _parse_int(rel.zr))
+            formula = f"zs·|ωs−ωc|/60 = {teeth[0]}·|ω{_parse_int(rel.s)}−ω{_parse_int(rel.c)}|/60"
+
+        const, coefs = signed_rel_speed(positions, teeth)
+        dep = [free_pos[f] + 1 for t, f in enumerate(free_cols) if coefs[t] != 0]
+        item: dict = {
+            "relation": k,
+            "type": rel.type,
+            "formula": formula,
+            "determined": not dep,
+        }
+        if dep:
+            item["undetermined"] = True
+            item["depends_on_free"] = dep
+            bases.append(item)
+            continue
+        # 基频 = |带符号啮合相对转速| / 60
+        frequency = abs(const) / Fraction(60)
+        item["zero"] = frequency == 0
+        item["frequency"] = _fraction_json(frequency)
+        bases.append(item)
+        if frequency != 0:
+            determined.append((k, frequency))
+
+    # ---------- 1～12 次谐波按精确频率分组，仅保留 ≥2 条不同关系的重合组 ----------
+    groups_map: dict[Fraction, list[dict]] = {}
+    for k, f0 in determined:
+        for h in range(1, MAX_HARMONIC + 1):
+            groups_map.setdefault(h * f0, []).append(
+                {"relation": k, "harmonic": h}
+            )
+    coincidences = []
+    for freq in sorted(groups_map):  # 组间按精确频率升序
+        entries = groups_map[freq]
+        if len({e["relation"] for e in entries}) < 2:
+            continue
+        entries.sort(key=lambda e: (e["relation"], e["harmonic"]))
+        coincidences.append(
+            {
+                "frequency": _fraction_json(freq),
+                "relations": sorted({e["relation"] for e in entries}),
+                "entries": entries,
+            }
+        )
+
+    return {
+        "status": "ok",
+        "shafts": shaft_ids,
+        "free_shafts": [shaft_ids[c] for c in free_cols],
+        "max_harmonic": MAX_HARMONIC,
+        "bases": bases,
+        "coincidences": coincidences,
     }
 
 

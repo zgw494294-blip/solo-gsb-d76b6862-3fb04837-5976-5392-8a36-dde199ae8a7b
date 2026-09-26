@@ -46,6 +46,16 @@
   链路**必经的关系序号**。起终点同轴时返回一条长度为零的空链路；不连通时返回
   零条并说明。页面上所选链路经过的关系蓝色高亮、必经关系绿色高亮（见下文
   “传动链路追踪”一节）。
+- **啮合谐波重合诊断**（`POST /api/mesh-harmonics`）：复用现有轴、传动关系与
+  已知转速的校验和同一套有理数求解，为每条关系计算啮合基频——外、内啮合
+  `f = za·|ωa|/60` Hz（由啮合方程亦等于 `zb·|ωb|/60`），行星组
+  `f = zs·|ωs−ωc|/60` Hz（亦等于 `zr·|ωr−ωc|/60`）。模型无解时原样返回
+  `/api/solve` 的冲突信息；欠定时，基频依赖自由变量的关系标为**未确定**、不
+  参与比较，其余关系仍给出精确频率（精确为 0 的基频列出但不产生谐波）。对每个
+  确定且非零的基频取 **1～12 次**整数倍谐波，按精确频率分组，只保留含至少
+  两条不同关系的**重合组**；组内按“关系录入序号、谐波次数”排序，组间按频率
+  升序。页面列出各关系基频与全部重合组，并紫色高亮参与重合的关系（见下文
+  “啮合谐波重合诊断”一节）。
 - 任何输入发生变更即自动清除旧结果，避免展示过期答案。
 
 ## 一条命令启动
@@ -80,6 +90,8 @@ uvicorn backend.app.main:app --reload --port 8000
   （见下文“理想传动转矩平衡”一节）；
 - `POST /api/transmission-paths`：传动链路追踪，求最短链路总数、字典序最小链路
   与必经关系（见下文“传动链路追踪”一节）。
+- `POST /api/mesh-harmonics`：啮合谐波重合诊断，求各关系基频与 1～12 次谐波的
+  精确重合组（见下文“啮合谐波重合诊断”一节）。
 
 `POST /api/solve`，JSON 请求体：
 
@@ -386,18 +398,138 @@ IEEE 754 双精度舍入（例如 `-7812500000000000000` 被解析成 `-78125000
 - 校验非法（轴/关系规则与 `/api/solve` 一致，或起终点未在轴列表中定义）时
   返回 HTTP 400 与集中错误列表。
 
+## 啮合谐波重合诊断：`POST /api/mesh-harmonics`
+
+请求体与 `/api/solve` **完全相同**（`shafts` / `relations` / `known`，校验规则
+完全复用），不再附带其他参数。后端对“传动关系 + 已知转速”模型做有理数求解，
+再为每条通过校验的关系计算啮合基频：
+
+- 外、内啮合：`f = za·|ωa|/60` Hz（由齐次啮合方程，精确等于 `zb·|ωb|/60`）；
+- 行星组：`f = zs·|ωs−ωc|/60` Hz（精确等于 `zr·|ωr−ωc|/60`）。
+
+```json
+{
+  "shafts": [{ "id": 1 }, { "id": 2 }, { "id": 3 }],
+  "relations": [
+    { "type": "external", "a": 1, "b": 2, "za": "20", "zb": "40" },
+    { "type": "external", "a": 2, "b": 3, "za": "60", "zb": "120" }
+  ],
+  "known": [
+    { "shaft": 1, "speed": "300" }
+  ]
+}
+```
+
+由关系 1 得 `ω₂ = −150`，关系 2 得 `ω₃ = 75`：关系 1 基频
+`f₁ = 20·300/60 = 100` Hz，关系 2 基频 `f₂ = 60·150/60 = 150` Hz。对每个确定
+且非零的基频展开 1～12 次整数倍谐波并按精确频率分组，只保留含至少两条不同
+关系的组；本例在 300 Hz（关系 1 的 3 次、关系 2 的 2 次）、600 Hz（6 次与
+4 次）、900 Hz（9 次与 6 次）、1200 Hz（12 次与 8 次）四处重合，响应为：
+
+```json
+{
+  "status": "ok",
+  "shafts": [1, 2, 3],
+  "free_shafts": [],
+  "max_harmonic": 12,
+  "bases": [
+    {
+      "relation": 1,
+      "type": "external",
+      "formula": "za·|ωa|/60 = 20·|ω1|/60",
+      "determined": true,
+      "zero": false,
+      "frequency": { "num": "100", "den": "1", "text": "100" }
+    },
+    {
+      "relation": 2,
+      "type": "external",
+      "formula": "za·|ωa|/60 = 60·|ω2|/60",
+      "determined": true,
+      "zero": false,
+      "frequency": { "num": "150", "den": "1", "text": "150" }
+    }
+  ],
+  "coincidences": [
+    {
+      "frequency": { "num": "300", "den": "1", "text": "300" },
+      "relations": [1, 2],
+      "entries": [
+        { "relation": 1, "harmonic": 3 },
+        { "relation": 2, "harmonic": 2 }
+      ]
+    },
+    {
+      "frequency": { "num": "600", "den": "1", "text": "600" },
+      "relations": [1, 2],
+      "entries": [
+        { "relation": 1, "harmonic": 6 },
+        { "relation": 2, "harmonic": 4 }
+      ]
+    },
+    {
+      "frequency": { "num": "900", "den": "1", "text": "900" },
+      "relations": [1, 2],
+      "entries": [
+        { "relation": 1, "harmonic": 9 },
+        { "relation": 2, "harmonic": 6 }
+      ]
+    },
+    {
+      "frequency": { "num": "1200", "den": "1", "text": "1200" },
+      "relations": [1, 2],
+      "entries": [
+        { "relation": 1, "harmonic": 12 },
+        { "relation": 2, "harmonic": 8 }
+      ]
+    }
+  ]
+}
+```
+
+字段说明：
+
+- `bases`：每条关系一项，`relation` 为关系录入序号（从 1 开始），`type` 为
+  关系类型，`formula` 为代入齿数与轴编号的基频公式；`determined` 表示基频是否
+  可在当前模型下确定。确定时给出精确基频 `frequency`（`{num, den, text}`
+  十进制整数字符串，单位 Hz），`zero = true` 表示基频精确为 0（如两啮合轴均
+  固定），零基频列出但**不产生谐波、不参与重合比较**。
+- `coincidences`：重合组列表，按精确频率升序；每组给出重合的精确 `frequency`
+  （Hz）、参与关系序号 `relations`，以及 `entries`——每项
+  `{relation, harmonic}` 指明是哪条关系的第几次谐波，组内严格按“关系录入序号、
+  谐波次数”排序。仅被一条关系的谐波命中的频率不会列出：每组至少涉及两条
+  **不同**关系。
+
+欠定与无解：
+
+- **欠定**：模型有自由变量时，若某条关系基频的仿射表达式中自由变量系数非零
+  （即基频依赖自由变量），该项为 `determined = false`、附 `undetermined = true`
+  与 `depends_on_free`（所依赖的自由变量序号列表），**不参与谐波比较**；其余
+  关系仍给出精确基频，`free_shafts` 同时列出自由轴。例如 4 根轴、两对独立外
+  啮合（1–2、3–4）只给 `ω₁ = 120`：关系 1 基频确定为 40 Hz，关系 2 基频依赖
+  自由变量、标为未确定，`coincidences` 为空。
+- **无解**：`status = "inconsistent"`，响应与 `/api/solve` 完全一致——附
+  `message` 与不可再缩减的 `conflict` 冲突条件集，页面同步红色高亮对应输入行，
+  不再给出任何基频或重合组。
+- 校验非法（轴/关系/已知转速规则与 `/api/solve` 一致）时返回 HTTP 400 与集中
+  错误列表。
+
+页面上“各关系基频”表逐行列出公式、精确频率与状态（确定 / 基频为 0 /
+未确定）；重合组逐个频率列出参与条目；所有参与重合的关系行以紫色高亮。
+点击“谐波诊断”以外的任何录入变更都会立即清空诊断结果与高亮。
+
 ## 目录结构
 
 ```
 .
 ├── backend/
 │   └── app/
-│       ├── main.py       # FastAPI 路由（/api/solve、/api/gear-options、/api/torque-balance、/api/transmission-paths）与静态文件托管
-│       └── solver.py     # 输入校验 + Fraction 精确 RREF 求解 + 1～500 配齿枚举 + 转矩平衡 + 最短链路追踪（BFS）
+│       ├── main.py       # FastAPI 路由（/api/solve、/api/gear-options、/api/torque-balance、/api/transmission-paths、/api/mesh-harmonics）与静态文件托管
+│       └── solver.py     # 输入校验 + Fraction 精确 RREF 求解 + 1～500 配齿枚举 + 转矩平衡 + 最短链路追踪（BFS）+ 啮合谐波重合诊断
 ├── frontend/
 │   ├── index.html
 │   ├── styles.css
-│   └── app.js            # 录入、校验提示、结果渲染、配齿回填、转矩平衡、链路追踪与高亮
+│   └── app.js            # 录入、校验提示、结果渲染、配齿回填、转矩平衡、链路追踪与高亮、谐波重合诊断与高亮
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

@@ -10,7 +10,7 @@
   <header class="site-header">
     <div class="wrap">
       <h1><span class="gear">⚙</span> 齿轮系转速求解台</h1>
-      <p class="sub">录入轴、传动关系与已知转速，以有理数精确联立 &mdash; 外啮合 / 内啮合 / 行星轮系 · 目标配齿 · 理想传动转矩平衡 · 传动链路追踪</p>
+      <p class="sub">录入轴、传动关系与已知转速，以有理数精确联立 &mdash; 外啮合 / 内啮合 / 行星轮系 · 目标配齿 · 理想传动转矩平衡 · 传动链路追踪 · 啮合谐波重合诊断</p>
     </div>
   </header>
 
@@ -100,6 +100,14 @@
       <p class="opt-note">以经过的关系数为路径长度：返回最短链路总数、按每步（关系录入序号、到达轴录入序号）字典序最小的链路，以及所有最短链路必经的关系序号；并行关系分别计数，行星组不拆成三条啮合。起终点同轴时返回一条长度为零的空链路，不连通时返回零条。</p>
     </section>
 
+    <section class="card" id="card-harmonics">
+      <div class="card-head">
+        <h2>⑦ 啮合谐波重合诊断 <span class="hint">外/内啮合 f = za·|ωa|/60 Hz，行星组 f = zs·|ωs−ωc|/60 Hz；取 1～12 次谐波比较</span></h2>
+        <button class="btn btn-primary" id="btn-harmonics" data-act="mesh-harmonics">谐波诊断</button>
+      </div>
+      <p class="opt-note">复用上方轴、传动关系与已知转速精确求解各关系基频：欠定时基频依赖自由变量的关系标为“未确定”且不参与比较，其余给出精确频率；对每个确定且非零的基频取 1～12 次谐波，按精确频率分组，只列出含至少两条不同关系的重合组，并高亮参与关系。模型无解时返回原有冲突信息。</p>
+    </section>
+
     <div class="action-bar">
       <button class="btn btn-primary btn-lg" id="btn-solve" data-act="solve">求 解</button>
     </div>
@@ -108,6 +116,7 @@
     <section id="options-result" class="result" hidden></section>
     <section id="torque-result" class="result" hidden></section>
     <section id="path-result" class="result" hidden></section>
+    <section id="harmonics-result" class="result" hidden></section>
   </main>
 
   <footer class="site-footer wrap">

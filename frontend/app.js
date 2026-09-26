@@ -347,11 +347,20 @@ function clearPathResult() {
   clearPathHighlights();
 }
 
+// 啮合谐波诊断结果同为独立区域，随任何录入变化清空（含参与关系高亮）
+function clearHarmonicsResult() {
+  const box = $('#harmonics-result');
+  box.hidden = true;
+  box.innerHTML = '';
+  clearHarmonicHighlights();
+}
+
 function clearAllResults() {
   clearResult();
   clearOptionsResult();
   clearTorqueResult();
   clearPathResult();
+  clearHarmonicsResult();
 }
 
 function clearConflictHighlights() {
@@ -373,6 +382,22 @@ function highlightPath(path, essential) {
   (path || []).forEach((s) => {
     const item = list.children[s.relation - 1];
     if (item) item.classList.add(essentialSet.has(s.relation) ? 'path-essential' : 'path-step');
+  });
+}
+
+// 啮合谐波诊断：清除/施加“参与重合组”的关系行高亮
+function clearHarmonicHighlights() {
+  document.querySelectorAll('.row-item.harmonic-hit')
+    .forEach((el) => el.classList.remove('harmonic-hit'));
+}
+
+function highlightHarmonics(relations) {
+  clearHarmonicHighlights();
+  const list = $('#relation-list');
+  if (!list) return;
+  (relations || []).forEach((k) => {
+    const item = list.children[k - 1];
+    if (item) item.classList.add('harmonic-hit');
   });
 }
 
@@ -458,6 +483,8 @@ document.addEventListener('click', (e) => {
     void runTorqueBalance();
   } else if (act === 'trace-path') {
     void runPathTrace();
+  } else if (act === 'mesh-harmonics') {
+    void runMeshHarmonics();
   } else if (act === 'apply-option') {
     applyGearOption(btn.dataset.relation, btn.dataset.field, btn.dataset.teeth);
   }
@@ -808,6 +835,17 @@ function conflictItemHTML(c, payload) {
   return `<li><code>条件 ${c.index}</code></li>`;
 }
 
+// 无解冲突清单：/api/solve 与啮合谐波诊断（模型无解时原样返回冲突信息）共用
+function conflictBoxHTML(conflict, payload) {
+  const items = conflict.map((c) => conflictItemHTML(c, payload)).join('');
+  return `
+    <div class="conflict-box">
+      <h3>冲突条件（按录入顺序，不可再缩减）</h3>
+      <ul class="conflict-list">${items}</ul>
+      <p class="conflict-note">对应输入行已用红色高亮标出；修改或删除其中任一条件后重新求解即可。</p>
+    </div>`;
+}
+
 function renderResult(data, payload) {
   const box = $('#result');
   if (data.status === 'unique') {
@@ -841,17 +879,12 @@ function renderResult(data, payload) {
       <div class="expr-list">${exprs}</div>`;
   } else if (data.status === 'inconsistent') {
     const conflict = Array.isArray(data.conflict) ? data.conflict : [];
-    const items = conflict.map((c) => conflictItemHTML(c, payload)).join('');
     box.innerHTML = `
       <div class="banner inconsistent">✕ 无解
         <span class="meta">已定位 ${conflict.length} 条相互冲突的条件：该集合本身无解，删去其中任意一条即恢复有解。</span>
       </div>
       <p>${esc(data.message || '方程组矛盾，该齿轮系无解。')}</p>
-      <div class="conflict-box">
-        <h3>冲突条件（按录入顺序，不可再缩减）</h3>
-        <ul class="conflict-list">${items}</ul>
-        <p class="conflict-note">对应输入行已用红色高亮标出；修改或删除其中任一条件后重新求解即可。</p>
-      </div>`;
+      ${conflictBoxHTML(conflict, payload)}`;
     highlightConflict(conflict);
   } else {
     box.innerHTML = `<div class="error-box"><h3>未知结果状态</h3></div>`;
@@ -1141,6 +1174,137 @@ function renderPathResult(data) {
     <div class="free-note">全部 ${esc(data.count)} 条最短链路必经的关系：${essentialText}。
     关系录入区中，所选链路经过的关系以蓝色高亮，必经关系以绿色高亮。</div>`;
   highlightPath(data.path || [], essential);
+}
+
+/* ============================== 啮合谐波重合诊断 ============================== */
+
+async function runMeshHarmonics() {
+  const btn = $('#btn-harmonics');
+  const box = $('#harmonics-result');
+  btn.disabled = true;
+  btn.textContent = '诊断中…';
+  clearHarmonicsResult();
+  box.hidden = false;
+  try {
+    const payload = buildPayload(); // 轴/关系/已知转速与转速求解完全相同
+    const resp = await fetch('/api/mesh-harmonics', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json().catch(() => null);
+    if (!resp.ok) {
+      renderHarmonicsErrors(extractErrors(resp.status, data));
+    } else {
+      renderHarmonicsResult(data, payload);
+    }
+  } catch (err) {
+    renderHarmonicsErrors([`网络或服务异常：${err.message}`]);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '谐波诊断';
+    box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+}
+
+function renderHarmonicsErrors(errors) {
+  const box = $('#harmonics-result');
+  box.innerHTML = `
+    <div class="error-box">
+      <h3>谐波诊断输入有误，共 ${errors.length} 项：</h3>
+      <ul>${errors.map((m) => `<li>${esc(m)}</li>`).join('')}</ul>
+    </div>`;
+}
+
+// 单条关系的基频行：确定（含零）给精确频率；未确定说明依赖的自由变量
+function harmonicBaseRow(b) {
+  let freq;
+  let status;
+  if (b.determined) {
+    freq = `${fracHTML(b.frequency)} <span class="unit">Hz</span>`;
+    status = b.zero
+      ? '<span class="badge">基频为 0，不产生谐波</span>'
+      : '<span class="badge solved">确定</span>';
+  } else {
+    const deps = (b.depends_on_free || []).map((t) => `t<sub>${t}</sub>`).join('、');
+    freq = '<span class="harmonic-undet">—</span>';
+    status = `<span class="badge free">未确定</span><span class="harmonic-dep">依赖自由变量 ${deps}，不参与比较</span>`;
+  }
+  return `
+    <tr>
+      <td><code>关系 ${esc(b.relation)}</code></td>
+      <td>${esc(TYPE_SHORT[b.type] || b.type)}</td>
+      <td class="num harmonic-formula">${esc(b.formula)}</td>
+      <td class="num">${freq}</td>
+      <td>${status}</td>
+    </tr>`;
+}
+
+function renderHarmonicsResult(data, payload) {
+  const box = $('#harmonics-result');
+  if (data.status === 'inconsistent') {
+    // 模型无解：原样展示 /api/solve 的冲突定位（含输入行红色高亮）
+    const conflict = Array.isArray(data.conflict) ? data.conflict : [];
+    box.innerHTML = `
+      <div class="banner inconsistent">✕ 模型无解，无法诊断谐波
+        <span class="meta">已定位 ${conflict.length} 条相互冲突的条件：该集合本身无解，删去其中任意一条即恢复有解。</span>
+      </div>
+      <p>${esc(data.message || '方程组矛盾，该齿轮系无解。')}</p>
+      ${conflictBoxHTML(conflict, payload)}`;
+    highlightConflict(conflict);
+    return;
+  }
+
+  const bases = Array.isArray(data.bases) ? data.bases : [];
+  const groups = Array.isArray(data.coincidences) ? data.coincidences : [];
+  const undetCount = bases.filter((b) => !b.determined).length;
+  const freeNote = (data.free_shafts || []).length
+    ? `模型欠定：自由轴 ${data.free_shafts.map(esc).join('、')}；${undetCount
+        ? `${undetCount} 条关系基频依赖自由变量，标为未确定且不参与比较。`
+        : '各关系基频均不依赖自由变量，全部精确确定。'}`
+    : '模型定解：各关系基频均为精确有理数。';
+
+  const baseRows = bases.map(harmonicBaseRow).join('');
+  const involved = new Set();
+  groups.forEach((g) => (g.relations || []).forEach((k) => involved.add(k)));
+
+  let groupsHTML;
+  if (!groups.length) {
+    groupsHTML = `
+      <div class="error-box options-empty">
+        <h3>无重合组</h3>
+        <p>在 1～${esc(data.max_harmonic)} 次谐波范围内，没有任何精确频率同时被至少两条不同关系命中
+        （未确定与零基频的关系不参与比较）。</p>
+      </div>`;
+  } else {
+    const items = groups.map((g) => {
+      const entries = (g.entries || []).map((e) =>
+        `<span class="harmonic-entry"><code>关系 ${esc(e.relation)}</code> 第 ${esc(e.harmonic)} 次谐波</span>`
+      ).join('');
+      return `
+        <li class="harmonic-group">
+          <div class="harmonic-group-head">精确频率 ${fracHTML(g.frequency)} <span class="unit">Hz</span>
+            <span class="badge known">${(g.relations || []).length} 条关系重合</span></div>
+          <div class="harmonic-entries">${entries}</div>
+        </li>`;
+    }).join('');
+    groupsHTML = `<ol class="harmonic-group-list">${items}</ol>`;
+  }
+
+  box.innerHTML = `
+    <div class="banner options">♪ 啮合谐波重合诊断
+      <span class="meta">确定且非零基频的关系取 1～${esc(data.max_harmonic)} 次谐波按精确频率分组；
+      共 ${groups.length} 个重合组，涉及 ${involved.size} 条关系（已在关系录入区高亮）。</span>
+    </div>
+    <div class="free-note">${freeNote}</div>
+    <h3 class="harmonic-h">各关系基频</h3>
+    <table class="speed-table harmonic-table">
+      <thead><tr><th>关系</th><th>类型</th><th>基频公式</th><th>基频 f</th><th>状态</th></tr></thead>
+      <tbody>${baseRows}</tbody>
+    </table>
+    <h3 class="harmonic-h">谐波重合组（按精确频率升序；组内按关系录入序号、谐波次数排序）</h3>
+    ${groupsHTML}`;
+  highlightHarmonics([...involved].sort((a, b) => a - b));
 }
 
 /* ============================== 启动 ============================== */
