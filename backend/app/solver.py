@@ -31,6 +31,14 @@ Aω=0，对其零空间的任意允许运动 v，外加转矩向量 τ 均须满
 s、r、c 三轴，组内任意两轴间一步可达；并行关系各自计数。以经过的关系
 数为路径长度做无权 BFS，返回最短链路总数、按每步“关系录入序号、到达
 轴录入序号”字典序最小的一条最短链路，以及所有最短链路必经的关系序号。
+
+/api/mesh-harmonics（啮合谐波重合诊断）复用轴/关系/已知转速的全部校验与
+同一套 RREF：外/内啮合基频 f=za·|ωa|/60 Hz，行星组基频 f=zs·|ωs−ωc|/60
+Hz，全部有理数精确计算；模型无解时返回与 /api/solve 相同的不可再缩减
+冲突集。欠定时基频仍依赖自由变量的关系标为“未确定”，不参与重合比较，
+其余关系给出精确基频。对每条确定且非零的基频取 1~12 次谐波，按精确频率
+分组，只列出包含至少两条不同关系的重合组；组按频率升序，组内成员按
+（关系录入序号, 谐波次数）升序。
 """
 
 from collections import deque
@@ -51,6 +59,7 @@ MAX_TORQUE_KNOWN = MAX_SHAFTS    # 已知/待求互不相交，总数天然不�
 MIN_TORQUE_UNKNOWN = 1
 MAX_TORQUE_UNKNOWN = MAX_SHAFTS
 MAX_DIGITS = 18  # 数字位数上限，防止恶意超大整数导致运算爆炸
+MAX_HARMONIC = 12  # 啮合谐波重合诊断：每条确定且非零的基频取 1~12 次谐波
 
 
 class Shaft(BaseModel):
@@ -1007,4 +1016,114 @@ def transmission_paths(req: TransmissionPathsRequest) -> dict:
         "count": total,
         "path": steps,
         "essential": essential,
+    }
+
+
+def mesh_harmonics(req: SolveRequest) -> dict:
+    """啮合谐波重合诊断：各关系基频取 1~12 次谐波，按精确频率找跨关系重合。
+
+    轴、传动关系与已知转速的校验和 /api/solve 完全复用；模型无解时返回与
+    /api/solve 相同的不可再缩减冲突集。基频（全部有理数精确计算）：
+      external/internal  f = za·|ωa|/60 Hz
+      planetary          f = zs·|ωs−ωc|/60 Hz
+    欠定时，基频表达式仍含自由变量的关系标为“未确定”，不参与重合比较；其余
+    关系给出精确基频。对每条确定且非零的基频取 1~12 次谐波，按精确频率分组，
+    只保留包含至少两条不同关系的重合组；组按频率升序，组内成员按
+    （关系录入序号, 谐波次数）升序。
+    """
+    prepared = _prepare(req)
+    shaft_ids = prepared["shaft_ids"]
+    index = prepared["index"]
+    n = prepared["n"]
+    rows = prepared["rows"]
+    row_tags = prepared["row_tags"]
+
+    # ---------- 高斯-若尔当消元（与 /api/solve 同一套 RREF） ----------
+    mat = [row[:] for row in rows]
+    pivot_cols = _rref(mat, n)
+
+    if any(all(row[j] == 0 for j in range(n)) and row[n] != 0 for row in mat):
+        # 无解：删除法定位不可再缩减的冲突条件集（与 /api/solve 相同）
+        kept = _minimize_conflict(rows, n)
+        return {
+            "status": "inconsistent",
+            "shafts": shaft_ids,
+            "message": "方程组出现矛盾方程 0 = 非零常数，该齿轮系无解。",
+            "conflict": [
+                {"type": row_tags[j][0], "index": row_tags[j][1]} for j in kept
+            ],
+        }
+
+    pivot_row_of = {c: i for i, c in enumerate(pivot_cols)}
+    free_cols = [j for j in range(n) if j not in pivot_row_of]
+
+    def omega_expr(col: int) -> tuple[Fraction, dict[int, Fraction]]:
+        """轴 col 转速的仿射表达式：常数项 + 各自由变量系数（自由轴自身即 t）。"""
+        if col in pivot_row_of:
+            r = pivot_row_of[col]
+            terms = {c: -mat[r][c] for c in free_cols if mat[r][c] != 0}
+            return mat[r][n], terms
+        return Fraction(0), {col: Fraction(1)}
+
+    # ---------- 各关系基频：依赖自由变量的标为未确定，不参与比较 ----------
+    relations_out: list[dict] = []
+    base_freqs: list[tuple[int, Fraction]] = []  # (关系录入序号, 确定且非零的基频)
+    for k, rel in enumerate(req.relations or [], start=1):
+        if rel.type in ("external", "internal"):
+            teeth = _parse_int(rel.za)
+            const, terms = omega_expr(index[_parse_int(rel.a)])
+        else:
+            teeth = _parse_int(rel.zs)
+            s_const, s_terms = omega_expr(index[_parse_int(rel.s)])
+            c_const, c_terms = omega_expr(index[_parse_int(rel.c)])
+            const = s_const - c_const
+            terms = dict(s_terms)
+            for c, coef in c_terms.items():
+                terms[c] = terms.get(c, Fraction(0)) - coef
+                if terms[c] == 0:
+                    del terms[c]
+        if terms:
+            # 基频仍依赖自由变量：未确定，不参与重合比较
+            relations_out.append({"relation": k, "type": rel.type, "determined": False})
+            continue
+        freq = Fraction(teeth) * abs(const) / 60
+        relations_out.append(
+            {
+                "relation": k,
+                "type": rel.type,
+                "determined": True,
+                "frequency": _fraction_json(freq),
+            }
+        )
+        if freq != 0:
+            base_freqs.append((k, freq))
+
+    # ---------- 1~12 次谐波按精确频率分组：只保留跨关系重合 ----------
+    buckets: dict[Fraction, list[tuple[int, int]]] = {}
+    for rel_no, f in base_freqs:
+        for h in range(1, MAX_HARMONIC + 1):
+            buckets.setdefault(f * h, []).append((rel_no, h))
+    groups = []
+    for freq in sorted(buckets):
+        members = sorted(buckets[freq])  # (关系录入序号, 谐波次数) 升序
+        if len({r for r, _ in members}) < 2:
+            continue  # 至少两条不同关系才算重合
+        groups.append(
+            {
+                "frequency": _fraction_json(freq),
+                "members": [
+                    {"relation": r, "harmonic": h} for r, h in members
+                ],
+            }
+        )
+
+    return {
+        "status": "ok",
+        "shafts": shaft_ids,
+        "rank": len(pivot_cols),
+        "free_count": len(free_cols),
+        "free_shafts": [shaft_ids[c] for c in free_cols],
+        "harmonic_max": MAX_HARMONIC,
+        "relations": relations_out,
+        "groups": groups,
     }

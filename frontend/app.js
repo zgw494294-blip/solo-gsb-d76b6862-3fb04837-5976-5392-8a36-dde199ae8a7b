@@ -347,11 +347,20 @@ function clearPathResult() {
   clearPathHighlights();
 }
 
+// 谐波诊断结果同为独立区域，随任何录入变化清空（含参与重合关系高亮）
+function clearHarmonicsResult() {
+  const box = $('#harmonics-result');
+  box.hidden = true;
+  box.innerHTML = '';
+  clearHarmonicHighlights();
+}
+
 function clearAllResults() {
   clearResult();
   clearOptionsResult();
   clearTorqueResult();
   clearPathResult();
+  clearHarmonicsResult();
 }
 
 function clearConflictHighlights() {
@@ -373,6 +382,25 @@ function highlightPath(path, essential) {
   (path || []).forEach((s) => {
     const item = list.children[s.relation - 1];
     if (item) item.classList.add(essentialSet.has(s.relation) ? 'path-essential' : 'path-step');
+  });
+}
+
+// 谐波诊断：清除关系录入行上的重合参与高亮
+function clearHarmonicHighlights() {
+  document.querySelectorAll('.row-item.harmonic')
+    .forEach((el) => el.classList.remove('harmonic'));
+}
+
+// 谐波诊断：参与任一重合组的关系行紫色高亮
+function highlightHarmonics(groups) {
+  clearHarmonicHighlights();
+  const list = $('#relation-list');
+  if (!list) return;
+  const involved = new Set();
+  (groups || []).forEach((g) => (g.members || []).forEach((m) => involved.add(m.relation)));
+  involved.forEach((k) => {
+    const item = list.children[k - 1];
+    if (item) item.classList.add('harmonic');
   });
 }
 
@@ -458,6 +486,8 @@ document.addEventListener('click', (e) => {
     void runTorqueBalance();
   } else if (act === 'trace-path') {
     void runPathTrace();
+  } else if (act === 'mesh-harmonics') {
+    void runMeshHarmonics();
   } else if (act === 'apply-option') {
     applyGearOption(btn.dataset.relation, btn.dataset.field, btn.dataset.teeth);
   }
@@ -1141,6 +1171,150 @@ function renderPathResult(data) {
     <div class="free-note">全部 ${esc(data.count)} 条最短链路必经的关系：${essentialText}。
     关系录入区中，所选链路经过的关系以蓝色高亮，必经关系以绿色高亮。</div>`;
   highlightPath(data.path || [], essential);
+}
+
+/* ============================== 啮合谐波重合诊断 ============================== */
+
+async function runMeshHarmonics() {
+  const btn = $('#btn-harmonics');
+  const box = $('#harmonics-result');
+  btn.disabled = true;
+  btn.textContent = '诊断中…';
+  clearHarmonicsResult();
+  box.hidden = false;
+  try {
+    const payload = buildPayload(); // 轴/传动关系/已知转速与“求解”完全相同
+    const resp = await fetch('/api/mesh-harmonics', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json().catch(() => null);
+    if (!resp.ok) {
+      renderHarmonicsErrors(extractErrors(resp.status, data));
+    } else {
+      renderHarmonicsResult(data, payload);
+    }
+  } catch (err) {
+    renderHarmonicsErrors([`网络或服务异常：${err.message}`]);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '谐波诊断';
+    box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+}
+
+function renderHarmonicsErrors(errors) {
+  const box = $('#harmonics-result');
+  box.innerHTML = `
+    <div class="error-box">
+      <h3>谐波诊断输入有误，共 ${errors.length} 项：</h3>
+      <ul>${errors.map((m) => `<li>${esc(m)}</li>`).join('')}</ul>
+    </div>`;
+}
+
+// 单条关系的基频公式：外/内啮合 f = za·|ωa|/60；行星组 f = zs·|ωs−ωc|/60
+function harmonicFormulaHTML(r, k) {
+  const t = (v) => (v === undefined || v === null || String(v).trim() === '' ? '?' : esc(String(v).trim()));
+  if (r && (r.type === 'external' || r.type === 'internal')) {
+    return `f<sub>${k}</sub> = ${t(r.za)}·|${omega(r.a)}| / 60`;
+  }
+  if (r && r.type === 'planetary') {
+    return `f<sub>${k}</sub> = ${t(r.zs)}·|${omega(r.s)} − ${omega(r.c)}| / 60`;
+  }
+  return `f<sub>${k}</sub>`;
+}
+
+function renderHarmonicsResult(data, payload) {
+  const box = $('#harmonics-result');
+  if (data.status === 'inconsistent') {
+    // 模型无解：与“求解”相同的冲突定位展示（红色高亮对应输入行）
+    const conflict = Array.isArray(data.conflict) ? data.conflict : [];
+    const items = conflict.map((c) => conflictItemHTML(c, payload)).join('');
+    box.innerHTML = `
+      <div class="banner inconsistent">✕ 无解
+        <span class="meta">转速方程组矛盾，无法计算啮合基频；已定位 ${conflict.length} 条相互冲突的条件：该集合本身无解，删去其中任意一条即恢复有解。</span>
+      </div>
+      <p>${esc(data.message || '方程组矛盾，该齿轮系无解。')}</p>
+      <div class="conflict-box">
+        <h3>冲突条件（按录入顺序，不可再缩减）</h3>
+        <ul class="conflict-list">${items}</ul>
+        <p class="conflict-note">对应输入行已用红色高亮标出；修改或删除其中任一条件后重新诊断即可。</p>
+      </div>`;
+    highlightConflict(conflict);
+    return;
+  }
+
+  const rels = Array.isArray(data.relations) ? data.relations : [];
+  const groups = Array.isArray(data.groups) ? data.groups : [];
+  const hmax = data.harmonic_max || 12;
+  const undetermined = rels.filter((r) => !r.determined).map((r) => r.relation);
+  const zeroRels = rels
+    .filter((r) => r.determined && r.frequency && fracParts(r.frequency).absNum === '0')
+    .map((r) => r.relation);
+
+  const rows = rels.map((r) => {
+    const rel = payload && payload.relations[r.relation - 1];
+    const freqCell = r.determined
+      ? fracHTML(r.frequency)
+      : '<span class="badge free">未确定</span>';
+    return `
+      <tr>
+        <td><code>关系 ${esc(r.relation)}</code></td>
+        <td>${esc(TYPE_SHORT[r.type] || r.type)}</td>
+        <td class="num">${harmonicFormulaHTML(rel, r.relation)}</td>
+        <td class="num">${freqCell}</td>
+        <td class="num">${r.determined ? 'Hz' : ''}</td>
+      </tr>`;
+  }).join('');
+
+  const notes = [];
+  if (undetermined.length) {
+    notes.push(`欠定：${undetermined.map((k) => `关系 ${k}`).join('、')} 的基频仍依赖自由变量，标为未确定，不参与重合比较。`);
+  }
+  if (zeroRels.length) {
+    notes.push(`${zeroRels.map((k) => `关系 ${k}`).join('、')} 的基频为 0，不产生谐波，不参与重合比较。`);
+  }
+  const noteHTML = notes.length ? `<div class="free-note">${notes.map(esc).join('<br />')}</div>` : '';
+
+  let groupsHTML;
+  if (groups.length) {
+    const items = groups.map((g) => {
+      const members = (g.members || [])
+        .map((m) => `<code>关系 ${esc(m.relation)}</code> ${esc(m.harmonic)} 次`)
+        .join('＝');
+      return `
+        <li class="harmonic-group-item">
+          <span class="harmonic-freq">${fracHTML(g.frequency)} Hz</span>
+          <span class="harmonic-members">${members}</span>
+        </li>`;
+    }).join('');
+    groupsHTML = `
+      <div class="options-meta">共 <strong>${groups.length}</strong> 组谐波重合（仅列出包含至少两条不同关系的重合组；组内按关系录入序号、谐波次数排序）</div>
+      <ol class="harmonic-list">${items}</ol>
+      <div class="free-note">参与重合的关系已在录入区以紫色高亮。</div>`;
+  } else {
+    groupsHTML = `
+      <div class="error-box options-empty">
+        <h3>无谐波重合</h3>
+        <p>在 1～${hmax} 次谐波范围内，没有任何精确频率被至少两条不同关系共享。</p>
+      </div>`;
+  }
+
+  const meta = data.free_count > 0
+    ? `欠定：自由轴 ${data.free_count} 根（${(data.free_shafts || []).map(esc).join('、')}）；未确定关系 ${undetermined.length} 条`
+    : `定解：全部 ${rels.length} 条关系基频确定`;
+  box.innerHTML = `
+    <div class="banner options">♪ 啮合谐波重合诊断
+      <span class="meta">谐波次数 1～${hmax}；${meta}</span>
+    </div>
+    ${noteHTML}
+    <table class="speed-table harmonics-table">
+      <thead><tr><th>关系</th><th>类型</th><th>基频公式</th><th>基频</th><th>单位</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    ${groupsHTML}`;
+  highlightHarmonics(groups);
 }
 
 /* ============================== 启动 ============================== */
